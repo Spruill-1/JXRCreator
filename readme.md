@@ -1,8 +1,10 @@
 # JXRMaker
 
-![Sample Image](OutputFile_SDR.jpg)
-
 JXRMaker is a simple command-line utility for creating HDR JPEG XR (JXR) images on Windows.
+
+## Sample
+
+![Sample Image](OutputFile_SDR.jpg)
 
 ## Usage
 
