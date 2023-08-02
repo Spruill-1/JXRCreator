@@ -168,7 +168,7 @@ int main(int argc, char* argv[])
         RETURN_FAILURE(frame->Commit());
 
         // Commit the buffers to the encoder as a whole (functionally this should be equivalent to the prior step
-        // in this particular single-frame case).
+        // in this particular single-frame case)
         RETURN_FAILURE(wicEncoder->Commit());
     }
 
