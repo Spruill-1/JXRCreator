@@ -20,7 +20,7 @@ For example, to create a 1920x1080 image and save it as `output.jxr`, you would 
 
 ## Viewing the Output
 
-The output files are saved in the HDR JPEG XR (.jxr) format, which is not supported by all image viewers. However, you can use the [HDR WCG Image Viewer](https://apps.microsoft.com/store/detail/hdr-wcg-image-viewer/9PGN3NWPBWL9?hl=en-us&gl=us) available in the Microsoft Store to view these images.
+The output files are saved in the HDR JPEG XR (.jxr) format, which is not supported by all image viewers. However, you can use the [HDR WCG Image Viewer](https://apps.microsoft.com/store/detail/hdr-wcg-image-viewer/9PGN3NWPBWL9?hl=en-us&gl=us) available in the Microsoft Store or [Github](https://github.com/13thsymphony/HDRImageViewer) to view these images.
 
 ## Building from Source
 
