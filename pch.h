@@ -5,5 +5,6 @@
 #include <objbase.h>
 #include <wincodec.h>
 #include <iostream>
+#include <cmath>
 #include <vector>
 #include <thread>

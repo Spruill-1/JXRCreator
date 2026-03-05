@@ -14,78 +14,47 @@ return hr;                                      \
 }                                               \
 }
 
-// The number of threads spun up to write pixel values out - even on enormous images 10 works pretty quick
-const size_t numThreads = 10;
-
-// The pixel format being used to create the output image - this is taken from the list here:
+// The pixel format used for the output image in the scRGB color space.
 // https://learn.microsoft.com/en-us/windows/win32/wic/-wic-codec-native-pixel-formats
 WICPixelFormatGUID wicFormatGUID = GUID_WICPixelFormat128bppRGBFloat;
-
-// The max channel value for the pixels - because they are 32bits-per-channel floating point values in the
-// scRGB space - values above 1 are used to specify 'HDR' colors. 
-const float maxChannelValue = 5.0f;
-
-// The struct used to write out the pixel data - note that it includes an extra float member for 'padding'
-// this is to account for the 128bpp floating point type used where each channel is a 32-bit float.
-struct PixelStruct
-{
-    float red;
-    float green;
-    float blue;
-    float padding;
-};
-
-// Define a few functions which determine how the pixel values are set based on the position in the image.
-inline float RPixel(float percentageWidth, float percentageHeight)
-{
-    // The max channel value for the pixels - because they are 32bits-per-channel floating point values in the
-    // scRGB space - values above 1 are used to specify 'HDR' colors. 
-    const float Peak = 5.0f;
-
-    return Peak * percentageWidth * percentageHeight;
-}
-inline float GPixel(float percentageWidth, float percentageHeight)
-{
-    // The max channel value for the pixels - because they are 32bits-per-channel floating point values in the
-    // scRGB space - values above 1 are used to specify 'HDR' colors. 
-    const float Peak = 5.0f;
-
-    return Peak * (1.f - percentageWidth) * (1.f-percentageHeight);
-}
-inline float BPixel(float percentageWidth, float percentageHeight)
-{
-    // The max channel value for the pixels - because they are 32bits-per-channel floating point values in the
-    // scRGB space - values above 1 are used to specify 'HDR' colors. 
-    const float Peak = 5.0f;
-
-    return Peak * (percentageWidth) * (1.f - percentageHeight);
-}
 
 int main(int argc, char* argv[])
 {
     HRESULT hr = S_OK;
     init_apartment();
 
-    // Get the width, height, and output filename from the command line args
-    if (argc < 4)
+    if (argc < 3)
     {
-        std::cerr << "Usage: " << argv[0] << "<width> <height> <image output path>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input image path> <output JXR path> [SDR white level in nits, default 200]" << std::endl;
         return E_INVALIDARG;
     }
 
-    int width = std::stoi(argv[1]);
-    int height = std::stoi(argv[2]);
-    std::wstring outputFile(MAX_PATH, L'\0');
-
+    // SDR reference white is 80 nits in scRGB (1.0). Most displays show SDR content
+    // much brighter than that, so we scale pixel values to match the desired level.
+    const float referenceWhiteNits = 80.0f;
+    float sdrWhiteNits = 200.0f;
+    if (argc >= 4)
     {
-        // We need the file path argument as a wide string
-        auto length = std::mbstowcs(nullptr, argv[3], 0);
-        outputFile.reserve(length);
-        std::mbstowcs(outputFile.data(), argv[3], length);
+        sdrWhiteNits = std::stof(argv[3]);
+    }
+    float nitsScale = sdrWhiteNits / referenceWhiteNits;
+
+    // Convert file path arguments to wide strings
+    std::wstring inputFile;
+    {
+        auto length = std::mbstowcs(nullptr, argv[1], 0);
+        inputFile.resize(length);
+        std::mbstowcs(inputFile.data(), argv[1], length);
+    }
+
+    std::wstring outputFile;
+    {
+        auto length = std::mbstowcs(nullptr, argv[2], 0);
+        outputFile.resize(length);
+        std::mbstowcs(outputFile.data(), argv[2], length);
     }
 
     winrt::com_ptr<IWICImagingFactory> factory = nullptr;
-    winrt::com_ptr<IWICBitmap> bitmap = nullptr;
 
     RETURN_FAILURE(CoCreateInstance(
         CLSID_WICImagingFactory,
@@ -94,83 +63,178 @@ int main(int argc, char* argv[])
         IID_PPV_ARGS(&factory)
     ));
 
-    RETURN_FAILURE(factory->CreateBitmap(width, height, wicFormatGUID, WICBitmapCacheOnDemand, bitmap.put()));
+    // Decode the input image
+    winrt::com_ptr<IWICBitmapDecoder> decoder = nullptr;
+    RETURN_FAILURE(factory->CreateDecoderFromFilename(
+        inputFile.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.put()));
 
-    // Lock the bitmap in a scoped block to properly handle releasing the lock.
+    winrt::com_ptr<IWICBitmapFrameDecode> sourceFrame = nullptr;
+    RETURN_FAILURE(decoder->GetFrame(0, sourceFrame.put()));
+
+    UINT width = 0, height = 0;
+    RETURN_FAILURE(sourceFrame->GetSize(&width, &height));
+
+    // Retrieve the source color context (embedded ICC profile, or fall back to sRGB)
+    winrt::com_ptr<IWICColorContext> sourceContext = nullptr;
+    RETURN_FAILURE(factory->CreateColorContext(sourceContext.put()));
+
     {
-        winrt::com_ptr<IWICBitmapLock> lock = nullptr;
-        WICRect rcLock = { 0, 0, width, height };
-        RETURN_FAILURE(bitmap->Lock(&rcLock, WICBitmapLockWrite, lock.put()));
+        UINT contextCount = 0;
+        bool foundContext = false;
 
-        UINT bufferSize = 0;
-        UINT bufferStride = 0;
-        BYTE* data = nullptr;
-
-        // Retrieve the raw data about the pixel data
-        RETURN_FAILURE(lock->GetStride(&bufferStride));
-        RETURN_FAILURE(lock->GetDataPointer(&bufferSize, &data));
-
-        // Each row starts at *previousRow + stride. Spin up a few threads to help speed this up.
-        std::vector<std::thread> threads(numThreads);
-        for (auto i = 0; i < numThreads; ++i)
+        if (SUCCEEDED(sourceFrame->GetColorContexts(0, nullptr, &contextCount)) && contextCount > 0)
         {
-            threads[i] = std::thread([&, i]()
+            std::vector<winrt::com_ptr<IWICColorContext>> contextPtrs(contextCount);
+            std::vector<IWICColorContext*> contextRaw(contextCount);
+
+            for (UINT i = 0; i < contextCount; ++i)
+            {
+                RETURN_FAILURE(factory->CreateColorContext(contextPtrs[i].put()));
+                contextRaw[i] = contextPtrs[i].get();
+            }
+
+            if (SUCCEEDED(sourceFrame->GetColorContexts(contextCount, contextRaw.data(), &contextCount)))
+            {
+                for (UINT i = 0; i < contextCount; ++i)
                 {
-                    for (auto y = i * height / numThreads; y < (i + 1) * height / numThreads; ++y)
+                    WICColorContextType type;
+                    if (SUCCEEDED(contextPtrs[i]->GetType(&type)) && type != WICColorContextUninitialized)
                     {
-                        BYTE* row = data + y * bufferStride;
-                        for (auto x = 0; x < width; ++x)
-                        {
-                            PixelStruct* pixel = reinterpret_cast<PixelStruct*>(row + x * sizeof(PixelStruct));
-
-                            float xPercentage = static_cast<float>(x) / width;
-                            float yPercentage = static_cast<float>(y) / height;
-
-                            pixel->red   = RPixel(xPercentage, yPercentage);
-                            pixel->blue  = GPixel(xPercentage, yPercentage);
-                            pixel->green = BPixel(xPercentage, yPercentage);
-                        }
+                        sourceContext = contextPtrs[i];
+                        foundContext = true;
+                        break;
                     }
-                });
+                }
+            }
         }
 
-        // Complete all the thread work
-        for (auto& thread : threads)
+        if (!foundContext)
         {
-            if (thread.joinable()) thread.join();
+            // No embedded profile found - assume sRGB
+            RETURN_FAILURE(sourceContext->InitializeFromExifColorSpace(1));
         }
     }
 
-    // Save the data to an image file
+    // Create the destination color context. scRGB shares sRGB's primaries and whitepoint;
+    // combined with the 128bppRGBFloat pixel format WIC will produce linear, extended-range
+    // scRGB values where wide-gamut colors may exceed [0,1].
+    winrt::com_ptr<IWICColorContext> destContext = nullptr;
+    RETURN_FAILURE(factory->CreateColorContext(destContext.put()));
+    RETURN_FAILURE(destContext->InitializeFromExifColorSpace(1)); // sRGB
+
+    // Pre-convert the decoded frame to 32bppBGRA — a universally supported
+    // pixel format for both IWICFormatConverter and IWICColorTransform.
+    winrt::com_ptr<IWICFormatConverter> formatConverter = nullptr;
+    RETURN_FAILURE(factory->CreateFormatConverter(formatConverter.put()));
+    RETURN_FAILURE(formatConverter->Initialize(
+        sourceFrame.get(), GUID_WICPixelFormat32bppBGRA,
+        WICBitmapDitherTypeNone, nullptr, 0.0f, WICBitmapPaletteTypeCustom));
+
+    // Apply the ICC color transform in 32bppBGRA space (source profile → sRGB).
+    // IWICColorTransform may not support 128bppRGBFloat as an output format, so
+    // we keep the data in 32bppBGRA and convert to linear scRGB float manually.
+    winrt::com_ptr<IWICBitmapSource> colorManagedSource;
     {
-        // Create the wic stream for the file
+        winrt::com_ptr<IWICColorTransform> colorTransform = nullptr;
+        hr = factory->CreateColorTransformer(colorTransform.put());
+        if (SUCCEEDED(hr))
+        {
+            hr = colorTransform->Initialize(
+                formatConverter.get(), sourceContext.get(), destContext.get(),
+                GUID_WICPixelFormat32bppBGRA);
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            colorManagedSource = colorTransform;
+        }
+        else
+        {
+            // Color transform not supported for this profile combination;
+            // proceed without ICC conversion (source is likely already sRGB).
+            std::cerr << "Warning: ICC color transform failed (0x" << std::hex << hr
+                      << std::dec << "), proceeding without conversion." << std::endl;
+            hr = S_OK;
+            colorManagedSource = formatConverter;
+        }
+    }
+
+    // Read the color-managed 32bppBGRA pixels.
+    UINT srcStride = width * 4;
+    UINT srcBufferSize = srcStride * height;
+    std::vector<BYTE> srcBuffer(srcBufferSize);
+    RETURN_FAILURE(colorManagedSource->CopyPixels(nullptr, srcStride, srcBufferSize, srcBuffer.data()));
+
+    // Pre-compute sRGB → linear lookup table for all 256 possible byte values.
+    float srgbToLinear[256];
+    for (int i = 0; i < 256; ++i)
+    {
+        float s = i / 255.0f;
+        srgbToLinear[i] = (s <= 0.04045f) ? (s / 12.92f) : powf((s + 0.055f) / 1.055f, 2.4f);
+    }
+
+    // Create the output bitmap in 128bppRGBFloat (scRGB) and populate it by
+    // converting each 32bppBGRA pixel to linear scRGB with nits scaling.
+    winrt::com_ptr<IWICBitmap> bitmap = nullptr;
+    RETURN_FAILURE(factory->CreateBitmap(width, height, wicFormatGUID, WICBitmapCacheOnDemand, bitmap.put()));
+
+    {
+        winrt::com_ptr<IWICBitmapLock> lock = nullptr;
+        WICRect rcLock = { 0, 0, static_cast<INT>(width), static_cast<INT>(height) };
+        RETURN_FAILURE(bitmap->Lock(&rcLock, WICBitmapLockWrite, lock.put()));
+
+        UINT dstBufferSize = 0;
+        UINT dstStride = 0;
+        BYTE* dstData = nullptr;
+
+        RETURN_FAILURE(lock->GetStride(&dstStride));
+        RETURN_FAILURE(lock->GetDataPointer(&dstBufferSize, &dstData));
+
+        for (UINT y = 0; y < height; ++y)
+        {
+            const BYTE* srcRow = srcBuffer.data() + y * srcStride;
+            float* dstRow = reinterpret_cast<float*>(dstData + y * dstStride);
+
+            for (UINT x = 0; x < width; ++x)
+            {
+                // 32bppBGRA: B=0, G=1, R=2, A=3
+                const BYTE* srcPixel = srcRow + x * 4;
+
+                // 128bppRGBFloat: R, G, B, padding
+                float* dstPixel = dstRow + x * 4;
+                dstPixel[0] = srgbToLinear[srcPixel[2]] * nitsScale;
+                dstPixel[1] = srgbToLinear[srcPixel[1]] * nitsScale;
+                dstPixel[2] = srgbToLinear[srcPixel[0]] * nitsScale;
+                dstPixel[3] = 0.0f;
+            }
+        }
+    }
+
+    // Encode the result as a JXR image
+    {
         winrt::com_ptr<IWICStream> wicStream = nullptr;
         RETURN_FAILURE(factory->CreateStream(wicStream.put()));
-        RETURN_FAILURE(wicStream->InitializeFromFilename(outputFile.c_str() , GENERIC_WRITE));
+        RETURN_FAILURE(wicStream->InitializeFromFilename(outputFile.c_str(), GENERIC_WRITE));
 
-        // Create the wic encoder
         winrt::com_ptr<IWICBitmapEncoder> wicEncoder = nullptr;
         RETURN_FAILURE(factory->CreateEncoder(GUID_ContainerFormatWmp, nullptr, wicEncoder.put()));
         RETURN_FAILURE(wicEncoder->Initialize(wicStream.get(), WICBitmapEncoderNoCache));
 
-        // Create and initialize the wic frame
         winrt::com_ptr<IWICBitmapFrameEncode> frame = nullptr;
         RETURN_FAILURE(wicEncoder->CreateNewFrame(frame.put(), nullptr));
         RETURN_FAILURE(frame->Initialize(nullptr));
         RETURN_FAILURE(frame->SetSize(width, height));
         RETURN_FAILURE(frame->SetPixelFormat(&wicFormatGUID));
 
-        // Write the pixel data to the frame encoder - note that this can only be done _after_ the IWICBitmapLock
-        // was released in the previous scope.
         RETURN_FAILURE(frame->WriteSource(bitmap.get(), nullptr));
 
-        // Commit the buffers to the encoder frame
         RETURN_FAILURE(frame->Commit());
-
-        // Commit the buffers to the encoder as a whole (functionally this should be equivalent to the prior step
-        // in this particular single-frame case)
         RETURN_FAILURE(wicEncoder->Commit());
     }
+
+    std::cout << "Created HDR JXR: " << argv[2]
+              << " (" << width << "x" << height
+              << ", SDR white = " << sdrWhiteNits << " nits)" << std::endl;
 
     return hr;
 }
